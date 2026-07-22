@@ -1,0 +1,281 @@
+"""Inference script for PRCV2026 Gaussian Denoising Challenge.
+
+Loads a Restormer model and runs single-forward-pass denoising
+on validation/test images with tile-based inference for large images.
+
+Usage:
+    conda activate prcv2026
+    python src/inference.py \
+        --weights pretrained_models/restormer_gaussian_sigma50.pth \
+        --input_dir data/val/noisy \
+        --result_dir results/val \
+        --tile_size 512 --tile_overlap 32
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import sys
+import time
+from pathlib import Path
+
+import cv2
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+# Add src directory to path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from model_arch import Restormer, count_parameters
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Restormer Denoising Inference")
+    parser.add_argument(
+        "--weights", type=str, required=True,
+        help="Path to Restormer pretrained weights (.pth)",
+    )
+    parser.add_argument(
+        "--input_dir", type=str, default="data/val/noisy",
+        help="Directory of input noisy images.",
+    )
+    parser.add_argument(
+        "--result_dir", type=str, default="results/val",
+        help="Directory to save denoised results.",
+    )
+    parser.add_argument(
+        "--tile_size", type=int, default=512,
+        help="Tile size for inference. 0 = no tiling (needs lots of VRAM).",
+    )
+    parser.add_argument(
+        "--tile_overlap", type=int, default=32,
+        help="Overlap between tiles.",
+    )
+    parser.add_argument(
+        "--device", type=str, default="auto",
+        help="Device: 'cuda', 'cpu', or 'auto'.",
+    )
+    return parser.parse_args()
+
+
+def load_img(path: Path) -> np.ndarray:
+    """Load image as RGB uint8 numpy array."""
+    img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise ValueError(f"Failed to read image: {path}")
+    if img.ndim != 3 or img.shape[2] != 3:
+        raise ValueError(f"Expected 3-channel image, got {img.shape}: {path}")
+    if img.dtype != np.uint8:
+        raise ValueError(f"Expected uint8, got {img.dtype}: {path}")
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
+def save_img(path: Path, img: np.ndarray) -> None:
+    """Save RGB uint8 numpy array as image."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    img = np.clip(img, 0, 255).astype(np.uint8)
+    cv2.imwrite(str(path), cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+
+
+def list_images(input_dir: Path) -> list[Path]:
+    """List all image files sorted by name."""
+    exts = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+    files = [p for p in input_dir.iterdir() if p.is_file() and p.suffix.lower() in exts]
+    return sorted(files, key=lambda p: p.name)
+
+
+def load_model(weights_path: str, device: torch.device) -> Restormer:
+    """Load Restormer model with pretrained weights."""
+    model = Restormer(layer_norm_type="BiasFree")
+    n_params = count_parameters(model)
+    print(f"Model parameters: {n_params:,} ({n_params / 1e6:.2f}M)")
+    if n_params > 50_000_000:
+        print("WARNING: Model exceeds 50M parameter limit! Score will be penalized 15%.")
+    else:
+        print("[OK] Model is within 50M parameter limit.")
+
+    # Load weights - handle different checkpoint formats
+    checkpoint = torch.load(weights_path, map_location="cpu")
+
+    # Try different key formats from various Restormer releases
+    if "params" in checkpoint:
+        state_dict = checkpoint["params"]
+    elif "state_dict" in checkpoint:
+        state_dict = checkpoint["state_dict"]
+    elif "model" in checkpoint:
+        state_dict = checkpoint["model"]
+    else:
+        state_dict = checkpoint
+
+    # Remove 'module.' prefix if present (from DataParallel)
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        name = k.replace("module.", "")
+        new_state_dict[name] = v
+
+    model.load_state_dict(new_state_dict, strict=True)
+    model.to(device).eval()
+    print(f"[OK] Weights loaded from: {weights_path}")
+    return model
+
+
+def tile_inference(
+    model: Restormer,
+    input_tensor: torch.Tensor,
+    tile_size: int,
+    tile_overlap: int,
+    factor: int = 8,
+) -> torch.Tensor:
+    """Run tiled inference with soft blending to eliminate seam artifacts."""
+    b, c, height, width = input_tensor.shape
+
+    if tile_size <= 0 or (height <= tile_size and width <= tile_size):
+        return model(input_tensor)
+
+    # Use stride = tile_size - tile_overlap for overlapping tiles
+    stride = tile_size - tile_overlap
+    tiles_x = max(1, math.ceil((width - tile_overlap) / stride))
+    tiles_y = max(1, math.ceil((height - tile_overlap) / stride))
+
+    # Accumulator for weighted blending
+    output = torch.zeros_like(input_tensor)
+    weight_map = torch.zeros(1, 1, height, width, device=input_tensor.device)
+
+    for ty in range(tiles_y):
+        for tx in range(tiles_x):
+            # Calculate tile coordinates
+            x0 = min(tx * stride, max(0, width - tile_size))
+            y0 = min(ty * stride, max(0, height - tile_size))
+            x1 = min(x0 + tile_size, width)
+            y1 = min(y0 + tile_size, height)
+
+            input_tile = input_tensor[:, :, y0:y1, x0:x1]
+
+            # Pad to be divisible by factor
+            _, _, tile_h, tile_w = input_tile.shape
+            pad_h = (factor - tile_h % factor) % factor
+            pad_w = (factor - tile_w % factor) % factor
+            if pad_h > 0 or pad_w > 0:
+                input_tile = F.pad(input_tile, (0, pad_w, 0, pad_h), mode="reflect")
+
+            with torch.no_grad():
+                restored_tile = model(input_tile)
+
+            # Remove padding
+            if pad_h > 0 or pad_w > 0:
+                restored_tile = restored_tile[:, :, :tile_h, :tile_w]
+
+            # Create a soft blending weight (raised cosine window)
+            tile_weight = torch.ones(1, 1, tile_h, tile_w, device=input_tensor.device)
+
+            # Apply cosine ramp on overlap borders
+            if tile_overlap > 0:
+                ramp = torch.linspace(0, 1, tile_overlap, device=input_tensor.device)
+                # Left border
+                if x0 > 0:
+                    tile_weight[:, :, :, :tile_overlap] *= ramp[None, None, None, :]
+                # Right border
+                if x1 < width:
+                    tile_weight[:, :, :, -tile_overlap:] *= ramp.flip(0)[None, None, None, :]
+                # Top border
+                if y0 > 0:
+                    tile_weight[:, :, :tile_overlap, :] *= ramp[None, None, :, None]
+                # Bottom border
+                if y1 < height:
+                    tile_weight[:, :, -tile_overlap:, :] *= ramp.flip(0)[None, None, :, None]
+
+            output[:, :, y0:y1, x0:x1] += restored_tile * tile_weight
+            weight_map[:, :, y0:y1, x0:x1] += tile_weight
+
+    # Normalize by weights
+    output = output / weight_map.clamp(min=1e-8)
+
+    return output
+
+
+def denoise_image(
+    model: Restormer,
+    image: np.ndarray,
+    tile_size: int,
+    tile_overlap: int,
+    device: torch.device,
+    factor: int = 8,
+) -> np.ndarray:
+    """Denoise a single image using the model (single forward pass, no TTA)."""
+    # Convert to tensor
+    input_tensor = torch.from_numpy(image.astype(np.float32) / 255.0)
+    input_tensor = input_tensor.permute(2, 0, 1).unsqueeze(0).to(device)
+
+    _, _, height, width = input_tensor.shape
+
+    # Pad input to be divisible by factor (for non-tiled inference)
+    pad_h = (factor - height % factor) % factor
+    pad_w = (factor - width % factor) % factor
+    if pad_h > 0 or pad_w > 0:
+        input_tensor = F.pad(input_tensor, (0, pad_w, 0, pad_h), mode="reflect")
+
+    # Single forward pass (no TTA, no self-ensemble)
+    with torch.no_grad():
+        output = tile_inference(model, input_tensor, tile_size, tile_overlap, factor)
+
+    # Remove padding
+    output = output[:, :, :height, :width]
+
+    # Convert back to uint8
+    output = torch.clamp(output.cpu(), 0, 1)[0].permute(1, 2, 0).numpy()
+    return np.clip(np.round(output * 255.0), 0, 255).astype(np.uint8)
+
+
+def main():
+    args = parse_args()
+
+    # Device setup
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
+    print(f"Using device: {device}")
+
+    # Load model
+    model = load_model(args.weights, device)
+
+    # List input images
+    input_dir = Path(args.input_dir)
+    result_dir = Path(args.result_dir)
+    result_dir.mkdir(parents=True, exist_ok=True)
+
+    files = list_images(input_dir)
+    if not files:
+        raise FileNotFoundError(f"No images found in {input_dir}")
+    print(f"Found {len(files)} images to process.")
+
+    # Process each image
+    total_time = 0
+    for idx, img_path in enumerate(files, start=1):
+        noisy = load_img(img_path)
+        h, w = noisy.shape[:2]
+
+        start_t = time.time()
+        restored = denoise_image(
+            model, noisy, args.tile_size, args.tile_overlap, device
+        )
+        elapsed = time.time() - start_t
+        total_time += elapsed
+
+        save_img(result_dir / img_path.name, restored)
+
+        if idx % 10 == 0 or idx == len(files):
+            print(
+                f"  [{idx:>3}/{len(files)}] {img_path.name} "
+                f"({w}x{h}) {elapsed:.1f}s"
+            )
+
+    print(f"\nDone! Total time: {total_time:.1f}s, "
+          f"Average: {total_time / len(files):.1f}s/image")
+    print(f"Results saved to: {result_dir}")
+
+
+if __name__ == "__main__":
+    main()
