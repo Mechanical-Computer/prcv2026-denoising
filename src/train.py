@@ -166,6 +166,76 @@ class PSNRLoss(nn.Module):
         return mse  # minimizing MSE = maximizing PSNR
 
 
+class SSIMLoss(nn.Module):
+    """Differentiable SSIM loss (1 - SSIM). Pure PyTorch, no external deps.
+
+    Computes SSIM over sliding windows using depthwise convolution with
+    a Gaussian kernel. Supports multi-channel images (e.g. RGB).
+    """
+    def __init__(self, window_size: int = 11, sigma: float = 1.5):
+        super().__init__()
+        self.window_size = window_size
+        self.sigma = sigma
+        self.C1 = 0.01 ** 2  # stabilizer for luminance
+        self.C2 = 0.03 ** 2  # stabilizer for contrast
+        # Pre-compute 2D Gaussian kernel
+        coords = torch.arange(window_size, dtype=torch.float32) - window_size // 2
+        g = torch.exp(-coords ** 2 / (2 * sigma ** 2))
+        kernel_1d = g / g.sum()
+        kernel_2d = kernel_1d[:, None] * kernel_1d[None, :]
+        # Shape: (1, 1, window_size, window_size)
+        self.register_buffer("kernel", kernel_2d.unsqueeze(0).unsqueeze(0))
+
+    def _ssim_map(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        channels = pred.shape[1]
+        # Expand kernel to (channels, 1, ws, ws) for depthwise conv
+        kernel = self.kernel.expand(channels, -1, -1, -1).to(pred.dtype)
+        pad = self.window_size // 2
+
+        mu_pred = F.conv2d(pred, kernel, padding=pad, groups=channels)
+        mu_target = F.conv2d(target, kernel, padding=pad, groups=channels)
+
+        mu_pred_sq = mu_pred * mu_pred
+        mu_target_sq = mu_target * mu_target
+        mu_cross = mu_pred * mu_target
+
+        sigma_pred_sq = F.conv2d(pred * pred, kernel, padding=pad, groups=channels) - mu_pred_sq
+        sigma_target_sq = F.conv2d(target * target, kernel, padding=pad, groups=channels) - mu_target_sq
+        sigma_cross = F.conv2d(pred * target, kernel, padding=pad, groups=channels) - mu_cross
+
+        # Clamp variances to avoid negative values from numerical errors
+        sigma_pred_sq = torch.clamp(sigma_pred_sq, min=0)
+        sigma_target_sq = torch.clamp(sigma_target_sq, min=0)
+
+        ssim_num = (2 * mu_cross + self.C1) * (2 * sigma_cross + self.C2)
+        ssim_den = (mu_pred_sq + mu_target_sq + self.C1) * (sigma_pred_sq + sigma_target_sq + self.C2)
+
+        return ssim_num / ssim_den
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        ssim_map = self._ssim_map(pred, target)
+        return 1.0 - ssim_map.mean()
+
+
+class HybridLoss(nn.Module):
+    """Combined Charbonnier + SSIM loss for jointly optimizing PSNR and SSIM.
+
+    total_loss = (1 - alpha) * Charbonnier + alpha * (1 - SSIM)
+
+    Default alpha=0.84 follows the MS-SSIM paper recommendation.
+    """
+    def __init__(self, alpha: float = 0.84, eps: float = 1e-3):
+        super().__init__()
+        self.alpha = alpha
+        self.charbonnier = CharbonnierLoss(eps=eps)
+        self.ssim_loss = SSIMLoss(window_size=11, sigma=1.5)
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        l_char = self.charbonnier(pred, target)
+        l_ssim = self.ssim_loss(pred, target)
+        return (1 - self.alpha) * l_char + self.alpha * l_ssim
+
+
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
@@ -201,8 +271,10 @@ def parse_args():
                    help="Learning rate (small for fine-tuning)")
     p.add_argument("--total_iters", type=int, default=50000)
     p.add_argument("--warmup_iters", type=int, default=1000)
-    p.add_argument("--loss", type=str, default="charbonnier",
-                   choices=["l1", "charbonnier", "mse"])
+    p.add_argument("--loss", type=str, default="hybrid",
+                   choices=["l1", "charbonnier", "mse", "hybrid"])
+    p.add_argument("--ssim_weight", type=float, default=0.84,
+                   help="Weight of SSIM in hybrid loss (0=pure Charbonnier, 1=pure SSIM)")
     # Mixed precision
     p.add_argument("--fp16", action="store_true", default=True,
                    help="Use mixed precision training (saves ~50%% VRAM)")
@@ -325,6 +397,9 @@ def main():
         criterion = CharbonnierLoss()
     elif args.loss == "mse":
         criterion = PSNRLoss()
+    elif args.loss == "hybrid":
+        criterion = HybridLoss(alpha=args.ssim_weight)
+        print(f"  Hybrid loss: Charbonnier weight={1-args.ssim_weight:.2f}, SSIM weight={args.ssim_weight:.2f}")
     print(f"Loss: {args.loss}")
 
     # ----- Optimizer & Scheduler -----
