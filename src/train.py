@@ -48,7 +48,15 @@ from model_arch import Restormer, count_parameters
 # ---------------------------------------------------------------------------
 
 class DenoisingDataset(Dataset):
-    """Paired noisy-clean dataset with on-the-fly augmentation."""
+    """Paired noisy-clean dataset with on-the-fly augmentation.
+
+    When use_synthetic_noise=True (Direction 3 / Domain-Gap fix):
+      - Ignores the noisy images on disk.
+      - Loads only the clean image and synthesizes fresh Gaussian noise
+        with sigma randomly sampled from [sigma_min, sigma_max] every time.
+      - Forces the model to generalise to the full range of noise levels
+        instead of memorising the fixed-sigma training distribution.
+    """
 
     def __init__(
         self,
@@ -56,11 +64,17 @@ class DenoisingDataset(Dataset):
         clean_dir: str,
         patch_size: int = 128,
         augment: bool = True,
+        use_synthetic_noise: bool = False,
+        sigma_min: float = 40.0,
+        sigma_max: float = 60.0,
     ):
         self.noisy_dir = Path(noisy_dir)
         self.clean_dir = Path(clean_dir)
         self.patch_size = patch_size
         self.augment = augment
+        self.use_synthetic_noise = use_synthetic_noise
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
 
         # Find all matching pairs
         exts = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
@@ -75,7 +89,8 @@ class DenoisingDataset(Dataset):
             if cf.exists():
                 self.pairs.append((nf, cf))
 
-        print(f"Dataset: {len(self.pairs)} pairs from {noisy_dir}")
+        mode = f"synthetic noise σ~U[{sigma_min},{sigma_max}]" if use_synthetic_noise else "paired (disk)"
+        print(f"Dataset: {len(self.pairs)} pairs from {noisy_dir} | mode={mode}")
 
     def __len__(self):
         return len(self.pairs)
@@ -124,21 +139,45 @@ class DenoisingDataset(Dataset):
 
     def __getitem__(self, idx):
         noisy_path, clean_path = self.pairs[idx]
-        noisy = self._load_img(noisy_path)
         clean = self._load_img(clean_path)
 
-        # Random crop
-        noisy, clean = self._random_crop(noisy, clean)
+        if self.use_synthetic_noise:
+            # --- Direction 3: Dynamic noise synthesis ---
+            # Only crop from clean; synthesize noise AFTER crop to save memory
+            # Crop clean image first
+            h, w = clean.shape[:2]
+            ps = self.patch_size
+            if h < ps or w < ps:
+                pad_h = max(ps - h, 0)
+                pad_w = max(ps - w, 0)
+                clean = np.pad(clean, ((0, pad_h), (0, pad_w), (0, 0)), mode="reflect")
+                h, w = clean.shape[:2]
+            y = random.randint(0, h - ps)
+            x = random.randint(0, w - ps)
+            clean_patch = clean[y:y+ps, x:x+ps].copy()
 
-        # Data augmentation (training time only - allowed by rules)
-        if self.augment:
-            noisy, clean = self._augment(noisy, clean)
+            # Augment
+            if self.augment:
+                noisy_patch, clean_patch = self._augment(clean_patch.copy(), clean_patch)
 
-        # To tensor [0, 1]
-        noisy = torch.from_numpy(noisy.astype(np.float32) / 255.0).permute(2, 0, 1)
-        clean = torch.from_numpy(clean.astype(np.float32) / 255.0).permute(2, 0, 1)
+            # Synthesize fresh Gaussian noise with random sigma
+            sigma = random.uniform(self.sigma_min, self.sigma_max)
+            clean_f = clean_patch.astype(np.float32) / 255.0
+            noise = np.random.randn(*clean_f.shape).astype(np.float32) * (sigma / 255.0)
+            noisy_f = np.clip(clean_f + noise, 0.0, 1.0)
 
-        return noisy, clean
+            noisy_t = torch.from_numpy(noisy_f).permute(2, 0, 1)
+            clean_t = torch.from_numpy(clean_f).permute(2, 0, 1)
+        else:
+            # --- Original: load fixed paired images from disk ---
+            noisy = self._load_img(noisy_path)
+            noisy, clean = self._random_crop(noisy, clean)
+            if self.augment:
+                noisy, clean = self._augment(noisy, clean)
+            noisy_t = torch.from_numpy(noisy.astype(np.float32) / 255.0).permute(2, 0, 1)
+            clean_t = torch.from_numpy(clean.astype(np.float32) / 255.0).permute(2, 0, 1)
+
+        return noisy_t, clean_t
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +228,8 @@ class SSIMLoss(nn.Module):
     def _ssim_map(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         channels = pred.shape[1]
         # Expand kernel to (channels, 1, ws, ws) for depthwise conv
-        kernel = self.kernel.expand(channels, -1, -1, -1).to(pred.dtype)
+        # Move kernel to same device as input (fixes CUDA/CPU mismatch)
+        kernel = self.kernel.to(device=pred.device, dtype=pred.dtype).expand(channels, -1, -1, -1)
         pad = self.window_size // 2
 
         mu_pred = F.conv2d(pred, kernel, padding=pad, groups=channels)
@@ -231,9 +271,13 @@ class HybridLoss(nn.Module):
         self.ssim_loss = SSIMLoss(window_size=11, sigma=1.5)
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        l_char = self.charbonnier(pred, target)
-        l_ssim = self.ssim_loss(pred, target)
-        return (1 - self.alpha) * l_char + self.alpha * l_ssim
+        # Calculate loss in FP32 to prevent float16 overflow in SSIM variances
+        with torch.cuda.amp.autocast(enabled=False):
+            pred = pred.float()
+            target = target.float()
+            l_char = self.charbonnier(pred, target)
+            l_ssim = self.ssim_loss(pred, target)
+            return (1 - self.alpha) * l_char + self.alpha * l_ssim
 
 
 # ---------------------------------------------------------------------------
@@ -249,8 +293,42 @@ def calc_psnr_torch(pred: torch.Tensor, target: torch.Tensor) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Training
+# Training Utilities
 # ---------------------------------------------------------------------------
+
+class EMA:
+    """Exponential Moving Average of model weights.
+    Smooths out training fluctuations and generally provides a 0.1~0.2 dB PSNR boost.
+    """
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.model = model
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone().to(param.device)
+
+    def update(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                new_average = (1.0 - self.decay) * param.data + self.decay * self.shadow[name]
+                self.shadow[name] = new_average.clone()
+
+    def apply_shadow(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.backup[name] = param.data
+                param.data = self.shadow[name]
+
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.backup
+                param.data = self.backup[name]
+        self.backup = {}
+
 
 def parse_args():
     p = argparse.ArgumentParser(description="Fine-tune Restormer")
@@ -287,6 +365,13 @@ def parse_args():
                    help="Number of training samples to evaluate PSNR on")
     # Workers
     p.add_argument("--num_workers", type=int, default=2)
+    # Noise augmentation (Direction 3 - Domain Gap fix)
+    p.add_argument("--synthetic_noise", action="store_true", default=False,
+                   help="Re-synthesize noise from clean images instead of loading from disk")
+    p.add_argument("--sigma_min", type=float, default=40.0,
+                   help="Min noise sigma for synthetic noise (default: 40)")
+    p.add_argument("--sigma_max", type=float, default=60.0,
+                   help="Max noise sigma for synthetic noise (default: 60)")
     return p.parse_args()
 
 
@@ -384,6 +469,9 @@ def main():
     dataset = DenoisingDataset(
         args.train_noisy, args.train_clean,
         patch_size=args.patch_size, augment=True,
+        use_synthetic_noise=args.synthetic_noise,
+        sigma_min=args.sigma_min,
+        sigma_max=args.sigma_max,
     )
     loader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True,
@@ -406,6 +494,7 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = build_scheduler(optimizer, args.total_iters, args.warmup_iters)
     scaler = torch.cuda.amp.GradScaler(enabled=use_fp16)
+    ema = EMA(model, decay=0.999)
 
     print(f"LR: {args.lr}, Effective batch: {args.batch_size * args.grad_accum}")
     print(f"Patch: {args.patch_size}x{args.patch_size}, FP16: {use_fp16}")
@@ -449,6 +538,7 @@ def main():
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
+            ema.update()  # Update EMA weights after optimizer step
             scheduler.step()
 
         current_iter += 1
@@ -470,7 +560,9 @@ def main():
         # ----- Evaluation -----
         if current_iter % args.eval_every == 0:
             torch.cuda.empty_cache()
+            ema.apply_shadow()
             eval_psnr = evaluate(model, dataset, device, args.eval_samples)
+            ema.restore()
             print(f"  >> Eval PSNR: {eval_psnr:.4f} dB (best: {best_psnr:.4f} dB)")
 
             log_rows.append({
@@ -483,7 +575,9 @@ def main():
             if eval_psnr > best_psnr:
                 best_psnr = eval_psnr
                 save_path = output_dir / "best_model.pth"
+                ema.apply_shadow()
                 torch.save({"params": model.state_dict()}, save_path)
+                ema.restore()
                 print(f"  >> NEW BEST! Saved to {save_path}")
 
             model.train()
@@ -491,6 +585,7 @@ def main():
         # ----- Save checkpoint -----
         if current_iter % args.save_every == 0:
             save_path = output_dir / f"model_iter{current_iter}.pth"
+            ema.apply_shadow()
             torch.save({
                 "params": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
@@ -499,6 +594,7 @@ def main():
                 "iter": current_iter,
                 "best_psnr": best_psnr,
             }, save_path)
+            ema.restore()
             print(f"  >> Checkpoint saved: {save_path}")
 
     # ----- Final save -----
