@@ -444,7 +444,9 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     if device.type == "cuda":
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        n_gpus = torch.cuda.device_count()
+        for i in range(n_gpus):
+            print(f"  GPU {i}: {torch.cuda.get_device_name(i)} ({torch.cuda.get_device_properties(i).total_memory // 1024**3}GB)")
 
     # ----- Model -----
     model = Restormer(layer_norm_type="BiasFree")
@@ -459,6 +461,15 @@ def main():
     print(f"[OK] Loaded pretrained: {args.pretrained}")
 
     model.to(device)
+
+    # ----- Multi-GPU (DataParallel) -----
+    if device.type == "cuda" and torch.cuda.device_count() > 1:
+        print(f"[OK] Using DataParallel across {torch.cuda.device_count()} GPUs")
+        model = nn.DataParallel(model)
+        base_model = model.module  # unwrapped model for EMA / optimizer
+    else:
+        base_model = model
+
     model.train()
 
     # Enable gradient checkpointing for memory saving
@@ -491,10 +502,11 @@ def main():
     print(f"Loss: {args.loss}")
 
     # ----- Optimizer & Scheduler -----
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    # Always optimize base_model parameters (unwrapped from DataParallel)
+    optimizer = torch.optim.AdamW(base_model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = build_scheduler(optimizer, args.total_iters, args.warmup_iters)
     scaler = torch.cuda.amp.GradScaler(enabled=use_fp16)
-    ema = EMA(model, decay=0.999)
+    ema = EMA(base_model, decay=0.999)  # EMA on unwrapped model
 
     print(f"LR: {args.lr}, Effective batch: {args.batch_size * args.grad_accum}")
     print(f"Patch: {args.patch_size}x{args.patch_size}, FP16: {use_fp16}")
