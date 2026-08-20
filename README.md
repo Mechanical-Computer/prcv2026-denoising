@@ -1,77 +1,172 @@
-# PRCV2026 垃圾图像高斯噪声去噪挑战赛
+# PRCV2026 Gaussian Image Denoising — TinyLight Solution
 
-## 队伍信息
-- **队伍编号**: PRCV2026-0025
-- **队伍名称**: TinyLight
+**Competition:** PRCV2026 垃圾图像高斯噪声去噪挑战赛  
+**Final Rank:** 13th / ~35 teams  
+**Final Score:** PSNR 32.984 | SSIM 0.8920 | Final 33.792
 
-## 目录结构
+---
+
+## Model
+
+[**Restormer**](https://github.com/swz30/Restormer) (Restoration Transformer), self-implemented in a single standalone file — no need to install the full Restormer repo.
+
+| Config | Value |
+|:---|:---:|
+| Parameters | ~26.1M |
+| `dim` | 48 |
+| `num_blocks` | [4, 6, 6, 8] |
+| Attention | MDTA (Multi-Dconv Head Transposed Attention) |
+| FFN | GDFN (Gated-Dconv Feed-Forward Network) |
+| Layer Norm | BiasFree |
+
+## Pretrained Weights
+
+Download from the official Restormer release:
 
 ```
-competition/
-├── data/                       # 📂 数据集（不要修改）
-│   ├── train/
-│   │   ├── noisy/              # 训练集 noisy 图片 (2387张)
-│   │   └── clean/              # 训练集 clean 图片 (2387张)
-│   ├── val/
-│   │   └── noisy/              # 验证集 noisy 图片 (100张)
-│   ├── train_list.csv          # 训练集列表
-│   └── val_list.csv            # 验证集列表
-│
-├── src/                        # 📂 源代码
-│   ├── model_arch.py           # Restormer 模型架构定义
-│   ├── inference.py            # 推理脚本（单模型单次前向传播）
-│   ├── evaluate.py             # 评估脚本（PSNR/SSIM）
-│   ├── prepare_submit.py       # 提交文件打包脚本
-│   └── train.py                # 训练脚本（后续创建）
-│
-├── configs/                    # 📂 训练/推理配置文件
-│
-├── pretrained_models/          # 📂 预训练权重文件
-│
-├── results/                    # 📂 推理输出结果
-│   └── val/                    # 验证集去噪结果
-│
-├── submit/                     # 📂 提交文件
-│   └── Results_TinyLight.zip   # 打包好的提交文件
-│
-├── validate_results.py         # 官方验证脚本（保留原位）
-├── requirements.txt            # Python 依赖
-├── info.txt                    # 竞赛信息
-└── README.md                   # 本文件
+gaussian_color_denoising_sigma50.pth
 ```
 
-## 快速开始
+Place in `pretrained_models/`:
 
 ```bash
-# 1. 激活环境
-conda activate prcv2026
-
-# 2. 安装依赖
-pip install -r requirements.txt
-
-# 3. 下载预训练权重到 pretrained_models/ 目录
-
-# 4. 推理
-python src/inference.py \
-    --weights pretrained_models/restormer_gaussian_sigma50.pth \
-    --input_dir data/val/noisy \
-    --result_dir results/val \
-    --tile_size 256 --tile_overlap 32
-
-# 5. 打包提交
-python src/prepare_submit.py --result_dir results/val
-
-# 6. 评估（需要 clean ground truth）
-python src/evaluate.py \
-    --result_dir results/val \
-    --clean_dir data/train/clean
-
-# 7. 本地 Fine-tune 训练 (针对 4GB 显存优化)
-python src/train.py --pretrained pretrained_models/gaussian_color_denoising_sigma50.pth --train_noisy data/train/noisy --train_clean data/train/clean --output_dir experiments/finetune_v1 --patch_size 128 --batch_size 1 --grad_accum 4 --lr 2e-5 --total_iters 50000 --eval_every 5000 --save_every 10000 --eval_samples 20 --num_workers 2
+mkdir pretrained_models
+# Download from: https://github.com/swz30/Restormer/releases
 ```
 
-## 竞赛规则要点
-- ❌ 禁止自集成 / TTA（必须单模型单次前向传播）
-- ⚠️ 模型参数量 ≤ 50M（超限总分 ×85%）
-- ✅ 允许使用公开预训练模型和公开数据集
-- ✅ 训练阶段允许数据增强
+---
+
+## Environment
+
+```bash
+conda create -n denoising python=3.10
+conda activate denoising
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+pip install opencv-python einops timm tqdm
+```
+
+---
+
+## Data Structure
+
+```
+data/
+├── train/
+│   ├── noisy/      # *_noisy.png
+│   └── clean/      # *_clean.png  (same filename with _noisy → _clean)
+└── noisy/          # Test images (no labels)
+```
+
+---
+
+## Training
+
+### Single GPU (e.g. RTX 4090 24GB)
+
+```bash
+python src/train.py \
+    --pretrained pretrained_models/gaussian_color_denoising_sigma50.pth \
+    --output_dir experiments/finetune_v1 \
+    --synthetic_noise --sigma_min 35 --sigma_max 65 \
+    --loss hybrid --ssim_weight 0.1 \
+    --patch_size 256 --batch_size 3 --grad_accum 5 \
+    --lr 2e-5 --total_iters 60000
+```
+
+### Dual GPU (e.g. 2× RTX 4090 48GB, auto-detected)
+
+```bash
+python src/train.py \
+    --pretrained pretrained_models/gaussian_color_denoising_sigma50.pth \
+    --output_dir experiments/finetune_dual \
+    --synthetic_noise --sigma_min 35 --sigma_max 65 \
+    --loss hybrid --ssim_weight 0.1 \
+    --patch_size 384 --batch_size 6 --grad_accum 4 \
+    --lr 1e-5 --total_iters 60000
+```
+
+### Key Training Arguments
+
+| Argument | Default | Description |
+|:---|:---:|:---|
+| `--pretrained` | — | Path to pretrained `.pth` checkpoint |
+| `--loss` | `hybrid` | `l1` / `charbonnier` / `hybrid` |
+| `--ssim_weight` | 0.84 | Weight of SSIM in hybrid loss (0=pure Charbonnier) |
+| `--patch_size` | 128 | Training crop size |
+| `--batch_size` | 1 | Per-step batch size |
+| `--grad_accum` | 4 | Gradient accumulation steps |
+| `--synthetic_noise` | False | Re-synthesize noise from clean images |
+| `--sigma_min/max` | 40/60 | Noise sigma range for synthetic noise |
+| `--fp16` | True | Mixed precision training |
+
+---
+
+## Inference
+
+```bash
+python src/inference.py \
+    --weights experiments/finetune_dual/best_model.pth \
+    --input_dir data/noisy \
+    --result_dir results/output \
+    --tile_size 384 --tile_overlap 256
+```
+
+**Tile inference** is used to handle high-resolution images within VRAM limits.  
+Each tile uses soft cosine blending at borders to eliminate seam artifacts.
+
+| `tile_size` | `tile_overlap` | Notes |
+|:---:|:---:|:---|
+| 384 | 128 | Fast, matches training patch |
+| 384 | 256 | Higher quality, 2× slower |
+| 256 | 128 | For lower VRAM (< 8GB) |
+
+---
+
+## Code Structure
+
+```
+├── src/
+│   ├── model_arch.py   # Restormer architecture (standalone)
+│   ├── train.py        # Fine-tuning script
+│   │                   #   - Hybrid Loss (Charbonnier + SSIM)
+│   │                   #   - EMA (Exponential Moving Average)
+│   │                   #   - Dynamic noise synthesis (sigma aug)
+│   │                   #   - Auto multi-GPU (DataParallel)
+│   │                   #   - Mixed precision (AMP)
+│   └── inference.py    # Tile inference with soft blending
+├── pretrained_models/
+├── data/
+├── experiments/
+└── results/
+```
+
+---
+
+## Key Techniques
+
+| Technique | Effect |
+|:---|:---|
+| **Hybrid Loss** (Charbonnier + SSIM) | SSIM improved from 0.885 → 0.892 |
+| **EMA** (decay=0.999) | Smooths weight oscillations, improves final model stability |
+| **Dynamic σ augmentation** (σ∈[35,65]) | Reduces domain gap between train and test noise distributions |
+| **Large patch training** (384×384) | Larger receptive field → better PSNR |
+| **Tile inference with overlap** | Handles any resolution within VRAM limits |
+| **FP16 inference** | ~2× faster inference, negligible quality loss |
+
+---
+
+## Results
+
+| Experiment | PSNR (online) | SSIM | Notes |
+|:---|:---:|:---:|:---|
+| v1 baseline | 33.67 | 0.885 | Charbonnier only, patch=128 |
+| v3 hybrid | 33.75 | 0.890 | SSIM weight=0.5 |
+| 4090 dual + sigma aug | **32.98** | **0.892** | Final submission |
+
+*(Online scores use a harder test set than local validation)*
+
+---
+
+## License
+
+MIT
