@@ -6,9 +6,9 @@
 
 ---
 
-![image-20260821021754716](E:\Program Files\Typora\typora-user-images\image-20260821021754716.png)
+![去噪结果图](img\denoising.png)
 
-![image-20260821014551996](E:\Program Files\Typora\typora-user-images\image-20260821014551996.png)
+![排名结果](img\result.png)
 
 ## Model
 
