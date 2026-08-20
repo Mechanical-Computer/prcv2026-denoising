@@ -6,9 +6,9 @@
 
 ---
 
-![去噪结果图](img\denoising.png)
+![去噪结果图](img/denoising.png)
 
-![排名结果](img\result.png)
+![排名结果](img/result.png)
 
 ## Model
 
